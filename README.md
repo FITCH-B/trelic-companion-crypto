@@ -29,10 +29,20 @@ One 32-byte **pairing secret** is generated on the desktop, displayed once in
 Settings, and typed into the phone. Everything else is derived from it:
 
 ```
-channelId = sha256("trelic-remote-channel:" + secret)[:32 hex]
-key       = sha256("trelic-remote-key:"     + secret)      (AES-256-GCM)
+channelId = HKDF-SHA256(secret, salt, info="trelic-remote-channel")  -> 16 bytes, hex
+key       = HKDF-SHA256(secret, salt, info="trelic-remote-key")      -> 32 bytes, AES-256-GCM
 envelope  = { v:1, iv:<base64>, data:<base64 ciphertext||tag> }
 ```
+
+`salt` is the fixed non-secret string `trelic-remote-v1`. HKDF (RFC 5869) is
+used rather than a bare hash because it is the construction designed for
+deriving multiple independent keys from one secret: the `info` label gives
+proper domain separation, and it avoids the length-extension question that any
+prefix-hash construction invites.
+
+Both derivations **reject a secret that is not exactly 64 hex characters after
+normalisation.** Deriving from an empty or malformed secret would otherwise
+produce a fixed key that anyone reading this repository could compute.
 
 The relay is given the **`channelId`** so it knows which two devices to connect,
 and the **`envelope`** to pass along. That is all it ever receives.
@@ -60,6 +70,16 @@ Being precise about scope matters more than sounding secure:
   re-pairing.
 - **The relay learns metadata**: that a channel exists, roughly when messages
   flow, and their size. It does not learn contents.
+- **AES-GCM nonce bound.** IVs are 12 random bytes per message. With random
+  IVs, GCM should stay under roughly 2^32 messages per key (NIST SP 800-38D) —
+  a repeated IV under one key is catastrophic rather than merely weak. At one
+  message per second that bound is about 136 years, so it is not a practical
+  concern, but re-pairing rotates the secret if you want a fresh key.
+- **No forward secrecy.** The pairing secret is static for the life of the
+  pairing, so anyone who later obtains it can decrypt previously captured
+  traffic. A per-session handshake would fix that; it is not implemented
+  because the threat model here is an honest-but-curious relay, not an
+  adversary recording traffic for later.
 - **This is not an audited implementation.** It is standard primitives
   (SHA-256, AES-256-GCM) used in a straightforward way, published so it can be
   reviewed. If you find a flaw, please open an issue — that is the point of

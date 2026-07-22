@@ -1,16 +1,39 @@
 // crypto.js -- WebCrypto mirror of the desktop's remoteCrypto.js.
 // ANY change to derivations or envelope format there must be made here.
 //
-//   channelId = sha256("trelic-remote-channel:" + secret) [:32 hex]
-//   key       = sha256("trelic-remote-key:" + secret)     (AES-256-GCM)
+//   channelId = HKDF-SHA256(secret, salt, info="trelic-remote-channel")[:16 bytes] -> hex
+//   key       = HKDF-SHA256(secret, salt, info="trelic-remote-key")     (32 bytes, AES-256-GCM)
 //   envelope  = {v:1, iv:<b64>, data:<b64 ct||tag>}  (WebCrypto native)
+//
+// Both sides feed HKDF the same inputs: ikm = the UTF-8 bytes of the
+// normalised 64-char hex secret, salt = "trelic-remote-v1", and the info
+// label above. RFC 5869 is deterministic, so Node's hkdfSync and
+// WebCrypto's deriveBits produce identical output for identical inputs --
+// that equivalence is worth re-testing if either side is ever touched.
+//
+// The secret is validated before any derivation: an empty or malformed
+// secret would otherwise produce a fixed key that anyone reading this
+// file could compute. Do not remove that check.
 
 const RemoteCrypto = (() => {
   const enc = new TextEncoder();
   const dec = new TextDecoder();
 
+  const SECRET_HEX_LEN = 64;
+  const HKDF_SALT = 'trelic-remote-v1';
+  const INFO_CHANNEL = 'trelic-remote-channel';
+  const INFO_KEY = 'trelic-remote-key';
+
   function normalizeSecret(input) {
     return String(input || '').toLowerCase().replace(/[^a-f0-9]/g, '');
+  }
+
+  function requireValidSecret(secret) {
+    const normalized = normalizeSecret(secret);
+    if (normalized.length !== SECRET_HEX_LEN) {
+      throw new Error(`Invalid pairing secret: expected ${SECRET_HEX_LEN} hex characters, got ${normalized.length}.`);
+    }
+    return normalized;
   }
 
   function toHex(buf) {
@@ -30,14 +53,23 @@ const RemoteCrypto = (() => {
     return out;
   }
 
+  async function hkdfBits(secret, info, bytes) {
+    const normalized = requireValidSecret(secret);
+    const ikm = await crypto.subtle.importKey('raw', enc.encode(normalized), 'HKDF', false, ['deriveBits']);
+    return crypto.subtle.deriveBits(
+      { name: 'HKDF', hash: 'SHA-256', salt: enc.encode(HKDF_SALT), info: enc.encode(info) },
+      ikm,
+      bytes * 8,
+    );
+  }
+
   async function channelIdFromSecret(secret) {
-    const digest = await crypto.subtle.digest('SHA-256', enc.encode(`trelic-remote-channel:${normalizeSecret(secret)}`));
-    return toHex(digest).slice(0, 32);
+    return toHex(await hkdfBits(secret, INFO_CHANNEL, 16));
   }
 
   async function keyFromSecret(secret) {
-    const digest = await crypto.subtle.digest('SHA-256', enc.encode(`trelic-remote-key:${normalizeSecret(secret)}`));
-    return crypto.subtle.importKey('raw', digest, 'AES-GCM', false, ['encrypt', 'decrypt']);
+    const bits = await hkdfBits(secret, INFO_KEY, 32);
+    return crypto.subtle.importKey('raw', bits, 'AES-GCM', false, ['encrypt', 'decrypt']);
   }
 
   async function encrypt(key, obj) {
@@ -63,5 +95,5 @@ const RemoteCrypto = (() => {
     return toHex(crypto.getRandomValues(new Uint8Array(8)));
   }
 
-  return { normalizeSecret, channelIdFromSecret, keyFromSecret, encrypt, decrypt, nonce };
+  return { normalizeSecret, requireValidSecret, channelIdFromSecret, keyFromSecret, encrypt, decrypt, nonce };
 })();
