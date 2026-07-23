@@ -21,6 +21,7 @@ class RelayClient {
     this.desktopOnline = false;
     this.closedByUser = false;
     this.reconnectDelay = 3000;
+    this.probeTimer = null;
   }
 
   // NO background keepalive timer, deliberately. An earlier version
@@ -30,6 +31,17 @@ class RelayClient {
   // sockets are detected by REAL traffic instead: a timed-out request
   // (the UI polls every 20s while visible) closes the socket and the
   // normal reconnect takes over. No timers, no false positives.
+  //
+  // ...with one gap that detection-by-traffic alone could not cover.
+  // While the desktop is believed OFFLINE the UI stops issuing requests,
+  // so nothing ever times out, so a half-open socket is never noticed --
+  // and the 'desktop-online' message that would clear the banner can
+  // never arrive on a dead socket. That is a terminal state: the app sits
+  // showing "disconnected" while the desktop is up and reconnected.
+  //
+  // probe() covers exactly that case. It is called only when the app is
+  // visible AND already showing disconnected, so it cannot fire on a
+  // healthy connection and cannot recreate the false-positive problem.
 
   state(s) { this.onState(s); }
 
@@ -66,6 +78,7 @@ class RelayClient {
     };
     ws.onclose = () => {
       if (this.ws !== ws) return;
+      this._clearProbe();
       this.state({ phase: 'disconnected', desktopOnline: false });
       this._failAll('Connection lost.');
       if (!this.closedByUser) this._scheduleReconnect();
@@ -75,7 +88,37 @@ class RelayClient {
 
   close() {
     this.closedByUser = true;
+    this._clearProbe();
     try { if (this.ws) this.ws.close(); } catch (e) {}
+  }
+
+  // Ask the relay to prove this socket is still alive. The relay answers
+  // {relay:'ka'} with {relay:'ka-ack'} (see server/src/relay.js) -- it has
+  // always supported this; nothing here previously used it. No answer
+  // inside the window means the path is dead, so close and let the normal
+  // reconnect run.
+  probe(timeoutMs = 5000) {
+    if (this.closedByUser || this.probeTimer) return;
+    const socket = this.ws;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    this.probeTimer = setTimeout(() => {
+      this.probeTimer = null;
+      // Only act if this is still the live socket -- a reconnect may have
+      // replaced it while the probe was outstanding.
+      if (this.ws === socket && socket.readyState === WebSocket.OPEN) {
+        try { socket.close(); } catch (e) {}
+      }
+    }, timeoutMs);
+    try {
+      socket.send(JSON.stringify({ relay: 'ka' }));
+    } catch (e) {
+      this._clearProbe();
+      try { socket.close(); } catch (e2) {}
+    }
+  }
+
+  _clearProbe() {
+    if (this.probeTimer) { clearTimeout(this.probeTimer); this.probeTimer = null; }
   }
 
   _scheduleReconnect() {
@@ -91,6 +134,11 @@ class RelayClient {
 
     // Relay housekeeping (unauthenticated presence hints).
     if (raw.relay) {
+      // Any answer at all proves the socket is alive, so a pending probe
+      // is satisfied by the ack specifically but also by anything else
+      // arriving -- the point is liveness, not the message.
+      if (raw.relay === 'ka-ack') { this._clearProbe(); return; }
+      this._clearProbe();
       if (raw.relay === 'joined') {
         this.reconnectDelay = 3000;
         this.desktopOnline = Boolean(raw.desktopOnline);
