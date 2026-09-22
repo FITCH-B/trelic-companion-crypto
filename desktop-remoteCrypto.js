@@ -46,9 +46,9 @@
 // relay plus a secret the user types once, not a global adversary
 // recording traffic for later.
 //
-// Replay protection lives in the PLAINTEXT (ts + nonce, checked by the
-// receiver in remoteControl.js), so a captured envelope is useless even
-// within the channel.
+// Freshness, unique IDs, and authenticated session binding are checked
+// by both remoteControl.js and the phone's relayClient.js. Encryption
+// alone does not reject recorded messages.
 
 const crypto = require('crypto');
 
@@ -62,6 +62,11 @@ const GCM_TAG_BYTES = 16;
 const HKDF_SALT = 'trelic-remote-v1';
 const INFO_CHANNEL = 'trelic-remote-channel';
 const INFO_KEY = 'trelic-remote-key';
+// A THIRD derivation, for proving channel ownership to the relay. The
+// relay holds this key (it has to, to verify) and never the encryption
+// key above; a different HKDF label guarantees one cannot be turned into
+// the other. Mirrored byte-for-byte in mobile/www/crypto.js.
+const INFO_AUTH = 'trelic-remote-auth';
 
 function generatePairingSecret() {
   return crypto.randomBytes(SECRET_BYTES).toString('hex');
@@ -102,6 +107,23 @@ function keyFromSecret(secret) {
   return hkdf(secret, INFO_KEY, 32);
 }
 
+function authKeyFromSecret(secret) {
+  return hkdf(secret, INFO_AUTH, 32).toString('hex');
+}
+
+function hmacHex(keyHex, message) {
+  return crypto.createHmac('sha256', Buffer.from(keyHex, 'hex')).update(String(message), 'utf8').digest('hex');
+}
+
+// Message shapes are shared with server/src/relayAuth.js and the phone.
+function helloProof(authKeyHex, nonce, channel, role) {
+  return hmacHex(authKeyHex, `${nonce}|${channel}|${role}`);
+}
+
+function pushProof(authKeyHex, op, channel, endpoint, ts) {
+  return hmacHex(authKeyHex, `push|${op}|${channel}|${endpoint}|${ts}`);
+}
+
 function encrypt(key, obj) {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
@@ -137,6 +159,10 @@ module.exports = {
   requireValidSecret,
   channelIdFromSecret,
   keyFromSecret,
+  authKeyFromSecret,
+  hmacHex,
+  helloProof,
+  pushProof,
   encrypt,
   decrypt,
 };

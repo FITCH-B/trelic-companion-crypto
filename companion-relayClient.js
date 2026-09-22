@@ -1,205 +1,155 @@
-// relayClient.js -- the phone's connection to the desktop, via the
-// relay. Owns the socket, the end-to-end encryption, request/response
-// matching, reconnection, and desktop presence.
-//
-// Usage:
-//   const client = new RelayClient({ relayUrl, secret, onState });
-//   await client.connect();
-//   const tasks = await client.request('get-tasks');
-
+// Authenticated companion sessions. No application message is accepted
+// merely because it decrypts: it must belong to this handshake and socket.
 class RelayClient {
-  constructor({ relayUrl, secret, onState, onEvent }) {
-    this.relayUrl = relayUrl;
-    this.secret = secret;
-    this.onState = onState || (() => {});
-    this.onEvent = onEvent || (() => {});
-    this.ws = null;
-    this.key = null;
-    this.channel = null;
-    this.pending = new Map(); // id -> {resolve, reject, timer}
-    this.nextId = 1;
-    this.desktopOnline = false;
-    this.closedByUser = false;
-    this.reconnectDelay = 3000;
-    this.probeTimer = null;
+  constructor({ relayUrl, secret, clientId, onState, onEvent }) {
+    this.relayUrl = relayUrl; this.secret = secret;
+    this.clientId = TrelicRemoteProtocol.validId(clientId) ? clientId : RemoteCrypto.nonce();
+    this.onState = onState || (() => {}); this.onEvent = onEvent || (() => {});
+    this.ws = null; this.pending = new Map(); this.seen = new Map();
+    this.generation = 0; this.connecting = null; this.closedByUser = false;
+    this.desktopOnline = false; this.authRejected = false; this.reconnectDelay = 3000;
+    this.reconnectTimer = null; this.probeTimer = null; this.handshakeTimer = null;
+    this.clientSession = null; this.desktopSession = null; this.handshakeId = null;
   }
-
-  // NO background keepalive timer, deliberately. An earlier version
-  // pinged every 25s and killed the socket on a missed ack -- browser
-  // timer throttling and a not-yet-restarted relay both turned that
-  // into constant false disconnects on healthy connections. Half-open
-  // sockets are detected by REAL traffic instead: a timed-out request
-  // (the UI polls every 20s while visible) closes the socket and the
-  // normal reconnect takes over. No timers, no false positives.
-  //
-  // ...with one gap that detection-by-traffic alone could not cover.
-  // While the desktop is believed OFFLINE the UI stops issuing requests,
-  // so nothing ever times out, so a half-open socket is never noticed --
-  // and the 'desktop-online' message that would clear the banner can
-  // never arrive on a dead socket. That is a terminal state: the app sits
-  // showing "disconnected" while the desktop is up and reconnected.
-  //
-  // probe() covers exactly that case. It is called only when the app is
-  // visible AND already showing disconnected, so it cannot fire on a
-  // healthy connection and cannot recreate the false-positive problem.
-
-  state(s) { this.onState(s); }
-
-  async connect() {
-    // One socket at a time. Calling connect() while a connection is
-    // already open or mid-handshake must be a no-op -- a second socket
-    // here creates a zombie whose close event flashes "reconnecting"
-    // and wipes the screen even though the survivor is healthy.
-    if (this.ws && (this.ws.readyState === WebSocket.CONNECTING || this.ws.readyState === WebSocket.OPEN)) return;
+  state(s) { try { this.onState(s); } catch (_) {} }
+  connect() {
+    if (this.connecting) return this.connecting;
+    if (this.ws && [WebSocket.CONNECTING, WebSocket.OPEN].includes(this.ws.readyState)) return Promise.resolve();
     this.closedByUser = false;
-    // Detach any dead/closing socket completely before replacing it so
-    // its late events can't reach the UI.
-    if (this.ws) {
-      try {
-        this.ws.onopen = this.ws.onmessage = this.ws.onclose = this.ws.onerror = null;
-        this.ws.close();
-      } catch (e) {}
-    }
-    this.key = await RemoteCrypto.keyFromSecret(this.secret);
-    this.channel = await RemoteCrypto.channelIdFromSecret(this.secret);
-    this.state({ phase: 'connecting' });
-
-    // Capture the socket: every handler ignores events from a socket
-    // that is no longer this.ws (belt over the detach above).
-    const ws = new WebSocket(this.relayUrl);
-    this.ws = ws;
-    ws.onopen = () => {
-      if (this.ws !== ws) return;
-      ws.send(JSON.stringify({ hello: { role: 'phone', channel: this.channel } }));
+    const generation = ++this.generation;
+    this._clearReconnect();
+    this.connecting = this._connect(generation).catch(err => {
+      if (generation === this.generation && !this.closedByUser) this.state({ phase: 'disconnected', desktopOnline: false, error: err.message });
+    }).finally(() => { if (generation === this.generation) this.connecting = null; });
+    return this.connecting;
+  }
+  async _connect(generation) {
+    const [key, channel, authKey] = await Promise.all([
+      RemoteCrypto.keyFromSecret(this.secret), RemoteCrypto.channelIdFromSecret(this.secret), RemoteCrypto.authKeyFromSecret(this.secret),
+    ]);
+    if (generation !== this.generation || this.closedByUser) return;
+    this.key = key; this.channel = channel; this.authKey = authKey;
+    this.authRejected = false; this.desktopOnline = false; this.seen.clear();
+    this.state({ phase: 'connecting', desktopOnline: false });
+    const ws = new WebSocket(this.relayUrl); this.ws = ws;
+    ws.onmessage = ev => {
+      if (this.ws !== ws || generation !== this.generation) return;
+      this._onMessage(ev.data, ws, generation).catch(() => {});
     };
-    ws.onmessage = (ev) => {
-      if (this.ws !== ws) return;
-      this._onMessage(ev.data);
-    };
-    ws.onclose = () => {
-      if (this.ws !== ws) return;
-      this._clearProbe();
-      this.state({ phase: 'disconnected', desktopOnline: false });
+    ws.onclose = ev => {
+      if (this.ws !== ws || generation !== this.generation) return;
+      this.ws = null; this._clearProbe(); this._clearHandshake();
+      this.desktopOnline = false; this.desktopSession = null;
       this._failAll('Connection lost.');
+      if (this.authRejected || ev?.code === 4003) {
+        this.authRejected = true; this.state({ phase: 'auth-failed', desktopOnline: false }); return;
+      }
+      this.state({ phase: ev?.code === 4004 ? 'not-registered' : 'disconnected', desktopOnline: false });
       if (!this.closedByUser) this._scheduleReconnect();
     };
-    ws.onerror = () => { /* onclose follows */ };
+    ws.onerror = () => {};
   }
-
   close() {
-    this.closedByUser = true;
-    this._clearProbe();
-    try { if (this.ws) this.ws.close(); } catch (e) {}
+    this.closedByUser = true; ++this.generation; this.connecting = null;
+    this._clearReconnect(); this._clearProbe(); this._clearHandshake();
+    const ws = this.ws; this.ws = null;
+    if (ws) { ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null; try { ws.close(); } catch (_) {} }
+    this.desktopOnline = false; this.desktopSession = null; this.clientSession = null;
+    this._failAll('Disconnected.'); this.state({ phase: 'disconnected', desktopOnline: false });
   }
-
-  // Ask the relay to prove this socket is still alive. The relay answers
-  // {relay:'ka'} with {relay:'ka-ack'} (see server/src/relay.js) -- it has
-  // always supported this; nothing here previously used it. No answer
-  // inside the window means the path is dead, so close and let the normal
-  // reconnect run.
-  probe(timeoutMs = 5000) {
-    if (this.closedByUser || this.probeTimer) return;
-    const socket = this.ws;
-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    this.probeTimer = setTimeout(() => {
-      this.probeTimer = null;
-      // Only act if this is still the live socket -- a reconnect may have
-      // replaced it while the probe was outstanding.
-      if (this.ws === socket && socket.readyState === WebSocket.OPEN) {
-        try { socket.close(); } catch (e) {}
-      }
-    }, timeoutMs);
-    try {
-      socket.send(JSON.stringify({ relay: 'ka' }));
-    } catch (e) {
-      this._clearProbe();
-      try { socket.close(); } catch (e2) {}
-    }
-  }
-
-  _clearProbe() {
-    if (this.probeTimer) { clearTimeout(this.probeTimer); this.probeTimer = null; }
-  }
-
+  _clearReconnect() { if (this.reconnectTimer) clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+  _clearProbe() { if (this.probeTimer) clearTimeout(this.probeTimer); this.probeTimer = null; }
+  _clearHandshake() { if (this.handshakeTimer) clearTimeout(this.handshakeTimer); this.handshakeTimer = null; this.handshakeId = null; }
   _scheduleReconnect() {
-    setTimeout(() => {
-      if (!this.closedByUser) this.connect();
-    }, this.reconnectDelay);
+    if (this.reconnectTimer || this.closedByUser || this.authRejected) return;
+    this.reconnectTimer = setTimeout(() => { this.reconnectTimer = null; if (!this.closedByUser) this.connect(); }, this.reconnectDelay);
     this.reconnectDelay = Math.min(this.reconnectDelay * 2, 30000);
   }
-
-  async _onMessage(text) {
-    let raw = null;
-    try { raw = JSON.parse(text); } catch (e) { return; }
-
-    // Relay housekeeping (unauthenticated presence hints).
+  probe(timeoutMs = 5000) {
+    const socket = this.ws;
+    if (this.closedByUser || this.probeTimer || !socket || socket.readyState !== WebSocket.OPEN) return;
+    this.probeTimer = setTimeout(() => { this.probeTimer = null; if (this.ws === socket) { try { socket.close(); } catch (_) {} } }, timeoutMs);
+    try { socket.send(JSON.stringify({ relay: 'ka' })); }
+    catch (_) { this._clearProbe(); try { socket.close(); } catch (_) {} }
+  }
+  async _beginSession(socket, generation) {
+    if (this.handshakeId || this.ws !== socket || generation !== this.generation) return;
+    this.desktopOnline = false; this.desktopSession = null; this.clientSession = RemoteCrypto.nonce();
+    this._failAll('Starting a new authenticated desktop session.');
+    const id = RemoteCrypto.nonce(), session = this.clientSession;
+    this.handshakeId = id;
+    this.handshakeTimer = setTimeout(() => {
+      if (this.handshakeId !== id) return;
+      this._clearHandshake();
+      this.state({ phase: 'connected', desktopOnline: false, error: 'Update the desktop app and reconnect to establish a secure session.' });
+    }, 15000);
+    try {
+      const envelope = await RemoteCrypto.encrypt(this.key, { protocol: 2, kind: 'session-hello', id, clientId: this.clientId,
+        clientSession: session, ts: Date.now(), nonce: RemoteCrypto.nonce() });
+      if (this.ws === socket && generation === this.generation && this.handshakeId === id && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(envelope));
+    } catch (_) {
+      if (this.handshakeId === id) {
+        this._clearHandshake();
+        this.state({ phase: 'connected', desktopOnline: false, error: 'Secure connection failed. Reconnect to try again.' });
+      }
+    }
+  }
+  async _onMessage(text, socket = this.ws, generation = this.generation) {
+    if (!socket || socket !== this.ws || generation !== this.generation || typeof text !== 'string' || text.length > 65536) return;
+    let raw; try { raw = JSON.parse(text); } catch (_) { return; }
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return;
     if (raw.relay) {
-      // Any answer at all proves the socket is alive, so a pending probe
-      // is satisfied by the ack specifically but also by anything else
-      // arriving -- the point is liveness, not the message.
-      if (raw.relay === 'ka-ack') { this._clearProbe(); return; }
       this._clearProbe();
-      if (raw.relay === 'joined') {
+      if (raw.relay === 'challenge' && typeof raw.nonce === 'string') {
+        const proof = await RemoteCrypto.helloProof(this.authKey, raw.nonce, this.channel, 'phone');
+        if (this.ws === socket && generation === this.generation && socket.readyState === WebSocket.OPEN)
+          socket.send(JSON.stringify({ hello: { role: 'phone', channel: this.channel, proof } }));
+      } else if (raw.relay === 'bad-auth') this.authRejected = true;
+      else if (raw.relay === 'joined' || raw.relay === 'desktop-online') {
         this.reconnectDelay = 3000;
-        this.desktopOnline = Boolean(raw.desktopOnline);
-        this.state({ phase: 'connected', desktopOnline: this.desktopOnline });
-      } else if (raw.relay === 'desktop-online') {
-        this.desktopOnline = true;
-        this.state({ phase: 'connected', desktopOnline: true });
+        this.state({ phase: 'connected', desktopOnline: false });
+        if (raw.relay === 'desktop-online' || raw.desktopOnline) await this._beginSession(socket, generation);
       } else if (raw.relay === 'desktop-offline') {
-        this.desktopOnline = false;
+        this.desktopOnline = false; this.desktopSession = null; this._clearHandshake(); this._failAll('Desktop is offline.');
         this.state({ phase: 'connected', desktopOnline: false });
       }
       return;
     }
-
-    // Everything else must decrypt with our key or it is ignored.
     const msg = await RemoteCrypto.decrypt(this.key, raw);
-    if (!msg) return;
-    if (msg.kind === 'res' && this.pending.has(msg.id)) {
-      const p = this.pending.get(msg.id);
-      this.pending.delete(msg.id);
-      clearTimeout(p.timer);
-      if (msg.ok) p.resolve(msg.result);
-      else p.reject(new Error(msg.error || 'Command failed.'));
-      return;
+    if (this.ws !== socket || generation !== this.generation || !msg || msg.clientId !== this.clientId || msg.clientSession !== this.clientSession) return;
+    if (msg.kind === 'session-ready') {
+      if (!this.handshakeId || msg.id !== this.handshakeId || !TrelicRemoteProtocol.validId(msg.desktopSession) || !TrelicRemoteProtocol.acceptFresh(msg, this.seen)) return;
+      this._clearHandshake(); this.desktopSession = msg.desktopSession; this.desktopOnline = true;
+      this.state({ phase: 'connected', desktopOnline: true }); return;
     }
-    // Desktop-initiated events (new approval, order update...) -- full
-    // detail, end-to-end encrypted. The UI refreshes instantly on these.
-    if (msg.kind === 'event') {
-      try { this.onEvent(msg); } catch (err) { /* UI callback must not kill the socket */ }
-    }
+    if (!this.desktopOnline || msg.desktopSession !== this.desktopSession || !['res', 'event'].includes(msg.kind)) return;
+    if (msg.kind === 'res' && (!this.pending.has(msg.id) || typeof msg.ok !== 'boolean')) return;
+    if (!TrelicRemoteProtocol.acceptFresh(msg, this.seen)) return;
+    if (msg.kind === 'res') {
+      const p = this.pending.get(msg.id); this.pending.delete(msg.id); clearTimeout(p.timer);
+      if (msg.ok) p.resolve(msg.result); else p.reject(new Error(msg.error || 'Command failed.'));
+    } else { try { this.onEvent(msg); } catch (_) {} }
   }
-
   request(cmd, params = {}, timeoutMs = 15000) {
-    return new Promise(async (resolve, reject) => {
-      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-        return reject(new Error('Not connected to the relay.'));
-      }
-      const id = this.nextId++;
-      const socket = this.ws;
+    return new Promise((resolve, reject) => {
+      const socket = this.ws, generation = this.generation, desktopSession = this.desktopSession, clientSession = this.clientSession;
+      if (!socket || socket.readyState !== WebSocket.OPEN || !this.desktopOnline || !desktopSession) return reject(new Error('No authenticated desktop session. Reconnect and update both apps.'));
+      const id = RemoteCrypto.nonce();
       const timer = setTimeout(() => {
-        this.pending.delete(id);
-        // A request that never got an answer on a socket still claiming
-        // to be open usually means the socket is half-open (network path
-        // died silently). Close it so the normal reconnect takes over --
-        // this replaces the old background keepalive with detection by
-        // real traffic only.
-        if (this.desktopOnline && this.ws === socket && socket.readyState === WebSocket.OPEN) {
-          try { socket.close(); } catch (e) {}
-        }
-        reject(new Error(this.desktopOnline ? 'Desktop did not answer in time.' : 'Desktop is offline.'));
+        this.pending.delete(id); reject(new Error('Desktop did not answer in time.'));
+        if (this.ws === socket && generation === this.generation) { try { socket.close(); } catch (_) {} }
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
-      const envelope = await RemoteCrypto.encrypt(this.key, {
-        kind: 'cmd', id, cmd, params, ts: Date.now(), nonce: RemoteCrypto.nonce(),
+      Promise.resolve().then(() => RemoteCrypto.encrypt(this.key, { protocol: 2, kind: 'cmd', id, cmd, params,
+        clientId: this.clientId, clientSession, desktopSession, ts: Date.now(), nonce: RemoteCrypto.nonce() })).then(envelope => {
+        if (!this.pending.has(id)) return;
+        if (this.ws !== socket || generation !== this.generation || this.desktopSession !== desktopSession || this.clientSession !== clientSession || socket.readyState !== WebSocket.OPEN) throw new Error('Connection changed before sending.');
+        socket.send(JSON.stringify(envelope));
+      }).catch(err => {
+        const p = this.pending.get(id); if (!p) return;
+        this.pending.delete(id); clearTimeout(p.timer); p.reject(err);
       });
-      this.ws.send(JSON.stringify(envelope));
     });
   }
-
-  _failAll(reason) {
-    for (const [, p] of this.pending) { clearTimeout(p.timer); p.reject(new Error(reason)); }
-    this.pending.clear();
-  }
+  _failAll(reason) { for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject(new Error(reason)); } this.pending.clear(); }
 }

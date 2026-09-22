@@ -1,0 +1,11 @@
+{
+  "name": "trelic-companion-crypto",
+  "version": "1.1.33",
+  "private": true,
+  "scripts": {
+    "test": "node --test session.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "desktopVersion": "1.1.33",
+  "protocol": 2,
+  "sha256": {
+    "desktop-remoteCrypto.js": "39e1c4fa63734afb7d7be1221c43d816ab581e877e2de80f73159d8efab0aa7b",
+    "companion-crypto.js": "12ff3b73808ad7ac1a0d8fd44708635debcbd1b7cb19a9a551a266c46b8d9635",
+    "companion-relayClient.js": "1b28ab4b1899db227d6a4e043eda190d4ae137d135bc873d3fceba460cbfe81b",
+    "remoteProtocol.js": "2a0565f730eff66dedba6735c5d407d99659c16741d60f7df730819d5fefd71c"
+  }
+}

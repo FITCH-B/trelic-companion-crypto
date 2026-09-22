@@ -1,107 +1,83 @@
-# trelic — companion encryption
+# trelic companion encryption and session protocol
 
-This repository contains the **complete encryption and relay-client code** used
-by the [trelic trading app](https://trelictech.com) to talk to its mobile
-companion. It is published so the claim below can be checked rather than
-trusted.
+This repository publishes the cryptography and phone relay client used with
+trelic desktop 1.1.33. The files are copied from the release sources. Their
+SHA-256 hashes are recorded in `release-files.json`.
 
-**The claim:** the relay server that carries messages between your desktop and
-your phone cannot read them, and cannot recover the key that would let it.
+| File | Purpose |
+| --- | --- |
+| `desktop-remoteCrypto.js` | Node implementation of key derivation and authenticated encryption |
+| `companion-crypto.js` | Matching WebCrypto implementation |
+| `companion-relayClient.js` | Phone connection lifecycle, authenticated sessions, requests, and events |
+| `remoteProtocol.js` | Shared freshness and duplicate-message checks |
 
-You do not have to take that on faith. Both halves of the implementation are
-here.
+Load the browser files in this order: `companion-crypto.js`,
+`remoteProtocol.js`, `companion-relayClient.js`.
 
-## What's in here
+## Encryption and relay authentication
 
-| File | Runs on | What it does |
-|---|---|---|
-| `desktop-remoteCrypto.js` | Desktop app (Node) | Generates the pairing secret, derives the channel id and key, encrypts/decrypts envelopes |
-| `companion-crypto.js` | Phone (WebCrypto) | The browser mirror of the above — must derive byte-identical values |
-| `companion-relayClient.js` | Phone | WebSocket client: connects to the relay, sends and receives encrypted envelopes |
+A randomly generated 32-byte pairing secret is the trust root. Both endpoints
+use HKDF-SHA256 with the fixed salt `trelic-remote-v1` and distinct info labels
+to derive the channel identifier, AES-256-GCM encryption key, and relay-auth
+key. Malformed secrets are rejected before derivation.
 
-Publishing both halves is deliberate: it lets you verify that the phone and the
-desktop derive the same key from the same secret, and that neither one sends
-anything to the relay in the clear.
+The encrypted envelope is `{v:1, iv, data}`. IVs are random 12-byte values;
+`data` holds ciphertext and the GCM authentication tag. Modified ciphertext
+and incorrect keys fail authentication.
 
-## The design
+The relay receives the channel identifier and a separate derived auth key
+from the desktop, then checks challenge proofs for joining clients. That key
+does not reveal the encryption key. The relay also receives presence/keepalive
+messages and kind-only push signals. It can observe metadata such as message
+timing and size, but not the encrypted command or response contents.
 
-One 32-byte **pairing secret** is generated on the desktop, displayed once in
-Settings, and typed into the phone. Everything else is derived from it:
+## Session protocol 2
 
-```
-channelId = HKDF-SHA256(secret, salt, info="trelic-remote-channel")  -> 16 bytes, hex
-key       = HKDF-SHA256(secret, salt, info="trelic-remote-key")      -> 32 bytes, AES-256-GCM
-envelope  = { v:1, iv:<base64>, data:<base64 ciphertext||tag> }
-```
+Decrypting successfully is not sufficient to accept an application message.
+The phone starts an encrypted handshake with an unpredictable request ID,
+phone session, stable phone ID, nonce, and timestamp. The desktop's matching
+response binds the exchange to its current randomly generated session.
 
-`salt` is the fixed non-secret string `trelic-remote-v1`. HKDF (RFC 5869) is
-used rather than a bare hash because it is the construction designed for
-deriving multiple independent keys from one secret: the `info` label gives
-proper domain separation, and it avoids the length-extension question that any
-prefix-hash construction invites.
+Commands, responses, and events carry these session identifiers. Responses
+must match an outstanding unpredictable request ID. Both endpoints reject
+expired messages, future timestamps outside the 75-second clock window,
+repeated message identifiers/nonces, and messages from previous sessions.
+These checks apply to application messages in both directions.
 
-Both derivations **reject a secret that is not exactly 64 hex characters after
-normalisation.** Deriving from an empty or malformed secret would otherwise
-produce a fixed key that anyone reading this repository could compute.
+Concurrent connection attempts share one operation. Disconnecting invalidates
+unfinished key derivation, encryption, requests, and old socket callbacks.
+Malformed messages and failed sends do not execute application commands.
 
-The relay is given the **`channelId`** so it knows which two devices to connect,
-and the **`envelope`** to pass along. That is all it ever receives.
+Desktop and companion must both support protocol 2. There is no fallback to
+accepting legacy application messages. After upgrading the desktop, reopen
+the companion so its service worker can load the current files.
 
-Because `channelId` and `key` are separate one-way derivations of the same
-secret, knowing the channel id reveals nothing about the key. The relay can see
-*that* your devices are talking. It cannot see *what* they say, and it cannot
-work backwards from what it holds to the key or the secret.
+## Verification
 
-Every message is AES-256-GCM, which is authenticated: a modified ciphertext
-fails to decrypt rather than producing altered plaintext. `decrypt()` returns
-`null` on any failure — wrong key, tampered data, malformed envelope — and never
-throws.
+Run `npm test` with Node 20 or later. No dependencies are required. The tests
+use local fake sockets and real WebCrypto/Node encryption. They cover stale,
+duplicate, unsolicited, and old-session messages, concurrent connections,
+disconnect during derivation/encryption, malformed envelopes, and failed sends.
+They do not connect to brokerage accounts or submit trades.
 
-## What this does *not* cover
+Compare the browser files with the live companion:
 
-Being precise about scope matters more than sounding secure:
+- https://trelictech.com/app/crypto.js
+- https://trelictech.com/app/relayClient.js
+- https://trelictech.com/app/remoteProtocol.js
 
-- **Your broker credentials and AI API key are not in this system at all.** They
-  are encrypted by your operating system's secure storage on your own machine
-  and are never transmitted anywhere — not to the relay, not to trelic's
-  servers. They never enter an envelope because they never leave the desktop.
-- **The pairing secret is as strong as how you handle it.** Anyone who obtains
-  it can read the channel. It is shown once, and you can rotate it by
-  re-pairing.
-- **The relay learns metadata**: that a channel exists, roughly when messages
-  flow, and their size. It does not learn contents.
-- **AES-GCM nonce bound.** IVs are 12 random bytes per message. With random
-  IVs, GCM should stay under roughly 2^32 messages per key (NIST SP 800-38D) —
-  a repeated IV under one key is catastrophic rather than merely weak. At one
-  message per second that bound is about 136 years, so it is not a practical
-  concern, but re-pairing rotates the secret if you want a fresh key.
-- **No forward secrecy.** The pairing secret is static for the life of the
-  pairing, so anyone who later obtains it can decrypt previously captured
-  traffic. A per-session handshake would fix that; it is not implemented
-  because the threat model here is an honest-but-curious relay, not an
-  adversary recording traffic for later.
-- **This is not an audited implementation.** It is standard primitives
-  (SHA-256, AES-256-GCM) used in a straightforward way, published so it can be
-  reviewed. If you find a flaw, please open an issue — that is the point of
-  this repository.
+The desktop command handlers and trading application are not included in this
+repository. Publishing these files is not a claim of a complete security audit.
 
-## Verifying it matches what actually ships
+## Limits
 
-The companion is a web app, so the code your phone runs is served directly and
-can be compared against this repository:
+Anyone who obtains the pairing secret can impersonate a paired endpoint and
+decrypt captured traffic. Session binding does not provide forward secrecy.
+Re-pairing rotates the secret. Device security and pairing-secret storage
+remain part of the trust boundary. Delivery can fail or be delayed; encryption
+cannot guarantee network availability.
 
-```
-https://trelictech.com/app/crypto.js
-https://trelictech.com/app/relayClient.js
-```
+The cryptographic primitives are unchanged in 1.1.33. This update strengthens
+message freshness, session binding, and connection handling.
 
-If those differ from the files here in any way that matters, that is a bug worth
-reporting.
-
-## About
-
-trelic is a desktop app that runs AI trading strategies against your own
-brokerage account. It never holds your funds and never receives your
-credentials. More at [trelictech.com](https://trelictech.com).
-
-Published under the MIT license so you can read, test, and reuse it.
+Published under the MIT license. See `LICENSE`.

@@ -23,6 +23,9 @@ const RemoteCrypto = (() => {
   const HKDF_SALT = 'trelic-remote-v1';
   const INFO_CHANNEL = 'trelic-remote-channel';
   const INFO_KEY = 'trelic-remote-key';
+  // Ownership proof for the relay -- a separate derivation from the
+  // encryption key. Mirrors remoteCrypto.js on the desktop exactly.
+  const INFO_AUTH = 'trelic-remote-auth';
 
   function normalizeSecret(input) {
     return String(input || '').toLowerCase().replace(/[^a-f0-9]/g, '');
@@ -92,8 +95,26 @@ const RemoteCrypto = (() => {
   }
 
   function nonce() {
-    return toHex(crypto.getRandomValues(new Uint8Array(8)));
+    return toHex(crypto.getRandomValues(new Uint8Array(16)));
   }
-
-  return { normalizeSecret, requireValidSecret, channelIdFromSecret, keyFromSecret, encrypt, decrypt, nonce };
+  function fromHex(hex) {
+    const out = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+    return out;
+  }
+  async function authKeyFromSecret(secret) {
+    return toHex(await hkdfBits(secret, INFO_AUTH, 32));
+  }
+  async function hmacHex(keyHex, message) {
+    const key = await crypto.subtle.importKey('raw', fromHex(keyHex), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    return toHex(await crypto.subtle.sign('HMAC', key, enc.encode(String(message))));
+  }
+  // Message shapes are shared with server/src/relayAuth.js and the desktop.
+  async function helloProof(authKeyHex, nonceValue, channel, role) {
+    return hmacHex(authKeyHex, `${nonceValue}|${channel}|${role}`);
+  }
+  async function pushProof(authKeyHex, op, channel, endpoint, ts) {
+    return hmacHex(authKeyHex, `push|${op}|${channel}|${endpoint}|${ts}`);
+  }
+  return { normalizeSecret, requireValidSecret, channelIdFromSecret, keyFromSecret, authKeyFromSecret, hmacHex, helloProof, pushProof, encrypt, decrypt, nonce };
 })();
